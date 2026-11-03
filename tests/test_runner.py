@@ -721,5 +721,181 @@ class PlatformTests(Sandbox):
         self.assertNotIn(value,redact('https://api.telegram.org/bot'+value+'/getMe'))
 
 
+class FileCacheAndReactionTests(Sandbox):
+    def setUp(self):
+        super().setUp()
+        self.reactions = []
+        self.sent_files = []
+        self.remote_files = {}
+
+        def react(chat_id, message_id, emoji, timeout=10):
+            self.reactions.append((chat_id, message_id, emoji))
+            return True
+
+        def download_file(file_id, destination, max_bytes=None, timeout=120):
+            import hashlib
+            raw = self.remote_files[file_id]
+            if max_bytes and len(raw) > max_bytes:
+                raise ValueError('exceeds max_bytes')
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(raw)
+            return {
+                'size': len(raw),
+                'md5': hashlib.md5(raw).hexdigest(),
+                'sha256': hashlib.sha256(raw).hexdigest(),
+                'file_path': 'documents/' + destination.name,
+            }
+
+        def send_file(chat_id, path, *, kind='document', filename=None, caption='', reply_to=None, timeout=180):
+            self.sent_files.append({
+                'chat_id': chat_id,
+                'path': Path(path),
+                'bytes': Path(path).read_bytes(),
+                'kind': kind,
+                'filename': filename or Path(path).name,
+                'caption': caption,
+                'reply_to': reply_to,
+            })
+            return {'message_id': 1000 + len(self.sent_files)}
+
+        self.api.react = react
+        self.api.download_file = download_file
+        self.api.send_file = send_file
+
+    def install_transform_plugin(self):
+        code = (
+            "from pathlib import Path\n"
+            "from telegram_task_runner.plugin_api import document, result\n"
+            "def handle(request, ctx):\n"
+            "    info = request['files'][0]\n"
+            "    raw = Path(info['path']).read_bytes()\n"
+            "    out = ctx.outputs_dir / info['name']\n"
+            "    out.write_bytes(bytes(b ^ 0x21 for b in raw))\n"
+            "    return result('transformed', files=[document(out, name=info['name'], caption='processed')])\n"
+        )
+        self.plugin(
+            'hello',
+            code=code,
+            commands={
+                'hello_file': {
+                    'description': '示例文件转换并回发',
+                    'mode': 'job',
+                    'permission': 'execute',
+                    'timeout_seconds': 30,
+                    'input_files': {'required': True, 'kinds': ['document'], 'extensions': ['.bin'], 'max_size_mb': 500},
+                    'output_files': {'max_count': 1, 'max_size_mb': 500},
+                }
+            },
+        )
+
+    def test_file_caption_and_reply_roundtrip_with_reactions(self):
+        self.install_transform_plugin()
+        host = self.make_host()
+        original_payload = b'SampleBinaryPayload1234567890'
+        self.remote_files['file_bin_1'] = original_payload
+
+        # 1. Trigger via Caption on document upload (including space before @bot mention in group chat)
+        upd1 = self.update(
+            text='',
+            caption='/hello_file @TestRunnerBot',
+            identifier=50,
+            document={'file_id': 'file_bin_1', 'file_unique_id': 'u1', 'file_name': ' Sample.bin ', 'file_size': len(original_payload)},
+        )
+        upd1['message'].pop('text', None)
+        host.handle(upd1)
+        self.assertEqual(self.reactions[-1], (-100, 50, '👀'))
+
+        # Run worker once
+        def stop_after_one(mode):
+            j = Store.claim(host.store, mode)
+            if j is None:
+                host.stop.set()
+            return j
+
+        with patch.object(host.store, 'claim', side_effect=stop_after_one):
+            host.work('job')
+        self.assertIn((-100, 50, '🤔'), self.reactions)
+
+        while host.deliver_one():
+            pass
+        self.assertEqual(self.reactions[-1], (-100, 50, '🎉'))
+        self.assertEqual(len(self.sent_files), 1)
+        transformed_bytes = self.sent_files[0]['bytes']
+        self.assertEqual(transformed_bytes, bytes(b ^ 0x21 for b in original_payload))
+        self.assertEqual(self.sent_files[0]['filename'], 'Sample.bin')
+
+        # 2. Trigger via Reply to a document message (round-trip XOR restores original bytes)
+        self.remote_files['file_bin_2'] = transformed_bytes
+        host.stop.clear()
+        upd2 = self.private_update(
+            text='/hello_file',
+            identifier=51,
+            reply_to_message={
+                'message_id': 49,
+                'document': {'file_id': 'file_bin_2', 'file_unique_id': 'u2', 'file_name': 'Sample.bin', 'file_size': len(transformed_bytes)},
+            },
+        )
+        host.handle(upd2)
+        with patch.object(host.store, 'claim', side_effect=stop_after_one):
+            host.work('job')
+        while host.deliver_one():
+            pass
+        self.assertEqual(len(self.sent_files), 2)
+        self.assertEqual(self.sent_files[1]['bytes'], original_payload)
+        # Verify the two invocations used distinct job directories
+        jobs = host.store.jobs(10)
+        self.assertEqual(len({j['id'] for j in jobs}), 2)
+
+    def test_input_validation_and_outbound_containment_and_cache_gc(self):
+        self.install_transform_plugin()
+        self.config['max_retained_jobs'] = 2
+        host = self.make_host()
+
+        # Missing required file is rejected with 😢 reaction
+        host.handle(self.private_update('/hello_file', identifier=60))
+        self.assertFalse(host.store.jobs())
+        self.assertEqual(self.reactions[-1], (1, 60, '😢'))
+
+        # Wrong extension is rejected
+        host.handle(self.private_update(
+            '/hello_file',
+            identifier=61,
+            document={'file_id': 'bad', 'file_name': 'notes.txt', 'file_size': 10},
+        ))
+        self.assertFalse(host.store.jobs())
+        self.assertEqual(self.reactions[-1], (1, 61, '😢'))
+
+        # Run 3 consecutive jobs with max_retained_jobs=2 -> oldest job dir is evicted before 3rd job snapshot
+        self.remote_files['f1'] = b'1111'
+        self.remote_files['f2'] = b'2222'
+        self.remote_files['f3'] = b'3333'
+        job_ids = []
+        for idx, fid in enumerate(('f1', 'f2', 'f3'), 70):
+            host.stop.clear()
+            host.handle(self.private_update(
+                '/hello_file',
+                identifier=idx,
+                document={'file_id': fid, 'file_name': f'{fid}.bin', 'file_size': 4},
+            ))
+            job_id = host.store.jobs(1)[0]['id']
+            job_ids.append(job_id)
+
+            def claim_once(mode):
+                j = Store.claim(host.store, mode)
+                if j is None:
+                    host.stop.set()
+                return j
+
+            with patch.object(host.store, 'claim', side_effect=claim_once):
+                host.work('job')
+            while host.deliver_one():
+                pass
+
+        remaining_dirs = {p.name for p in (self.layout.runtime / 'jobs').iterdir() if p.is_dir()}
+        self.assertNotIn(job_ids[0], remaining_dirs)
+        self.assertIn(job_ids[1], remaining_dirs)
+        self.assertIn(job_ids[2], remaining_dirs)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

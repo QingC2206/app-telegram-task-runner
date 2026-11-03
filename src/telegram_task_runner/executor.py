@@ -9,10 +9,47 @@ import sys
 import time
 import traceback
 from .plugin_api import Context
-from .util import Layout, atomic_json, contained, redact
+from .util import Layout, atomic_json, contained, redact, sanitize_filename
 from .locking import FileLock
 from .platforms.processes import ProcessTree
 import hashlib
+
+
+def _validate_output_files(directory: Path, spec: dict, files) -> list[dict]:
+    if not files:
+        return []
+    if not isinstance(files, list):
+        raise ValueError('插件回传 files 必须为列表')
+    out_spec = spec.get('output_files') or {}
+    max_count = int(out_spec.get('max_count', 10))
+    max_bytes = int(out_spec.get('max_size_mb', 2000)) * 1024 * 1024
+    if len(files) > max_count:
+        raise ValueError(f'插件回传文件数量超过上限 ({max_count})')
+    root = directory.resolve()
+    validated = []
+    total_size = 0
+    for item in files:
+        if isinstance(item, (str, Path)):
+            item = {'path': str(item), 'kind': 'document'}
+        if not isinstance(item, dict) or not isinstance(item.get('path'), str):
+            raise ValueError('回传文件项缺少有效 path')
+        kind = item.get('kind', 'document')
+        if kind not in ('document', 'photo'):
+            raise ValueError('回传文件 kind 仅支持 document 或 photo')
+        raw_path = Path(item['path'])
+        target = (raw_path if raw_path.is_absolute() else (directory / raw_path)).resolve()
+        if target == root or not target.is_relative_to(root) or not target.is_file():
+            raise ValueError('回传文件必须位于当前任务目录内且存在：' + str(item['path']))
+        size = target.stat().st_size
+        if kind == 'photo' and size > 10 * 1024 * 1024:
+            raise ValueError('回传 photo 超过 Telegram 10 MB 限制，请使用 document 发送')
+        total_size += size
+        if total_size > max_bytes:
+            raise ValueError(f'回传文件总大小超过上限 ({out_spec.get("max_size_mb", 2000)} MB)')
+        name = sanitize_filename(item.get('name') or target.name, default=target.name)
+        caption = str(item.get('caption') or '')[:900]
+        validated.append({'path': str(target), 'kind': kind, 'name': name, 'caption': caption, 'size': size})
+    return validated
 
 
 def execute(layout: Layout, job: dict, stop=None, progress=None):
@@ -26,12 +63,15 @@ def execute(layout: Layout, job: dict, stop=None, progress=None):
 
 def _execute(layout: Layout, job: dict, stop=None, progress=None):
     directory = contained(layout.runtime / 'jobs', job['id'])
+    (directory / 'inputs').mkdir(parents=True, exist_ok=True)
+    (directory / 'outputs').mkdir(parents=True, exist_ok=True)
     spec = json.loads(job['spec']) if isinstance(job['spec'], str) else job['spec']
     config = spec['config']
     wire = {'plugin_dir': str(directory / 'code'), 'state_dir': str(layout.runtime / 'plugin-state' / job['plugin']),
             'job_dir': str(directory), 'job_id': job['id'], 'entrypoint': spec['entrypoint'], 'config': config,
             'request': {'command': job['command'], 'argument': job['argument'], 'user_id': job['user_id'],
-                        'chat_id': job['chat_id'], 'message_id': job['message_id']}}
+                        'chat_id': job['chat_id'], 'message_id': job['message_id'],
+                        'files': spec.get('resolved_files', [])}}
     atomic_json(directory / 'worker.json', wire)
     keys = {'SYSTEMROOT','WINDIR','TEMP','TMP','PATH','USERPROFILE','LOCALAPPDATA','APPDATA','PROGRAMFILES','PROGRAMFILES(X86)',
             'HOME','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY','DOTNET_ROOT','NUGET_PACKAGES',
@@ -76,6 +116,8 @@ def _execute(layout: Layout, job: dict, stop=None, progress=None):
         raise ValueError('插件返回格式无效')
     if value.get('status') not in ('succeeded','failed','push_pending','uncertain') or (process.returncode and value['ok']):
         raise ValueError('插件返回状态与退出码不一致')
+    if 'files' in value:
+        value['files'] = _validate_output_files(directory, spec, value['files'])
     return value
 
 

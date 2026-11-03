@@ -1,7 +1,8 @@
-"""Durable inbox, job/resource claims, and notification outbox."""
+"""Durable inbox, job/resource claims, reaction journal, cache GC, and notification outbox."""
 from __future__ import annotations
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import threading
 import time
@@ -25,8 +26,18 @@ class Store:
             CREATE TABLE IF NOT EXISTS resources(name TEXT PRIMARY KEY,job TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(
                 id INTEGER PRIMARY KEY,event_key TEXT UNIQUE,chat_id INTEGER,message_id INTEGER,text TEXT,
-                status TEXT DEFAULT 'pending',due REAL DEFAULT 0,error TEXT,telegram_message_id INTEGER);
+                status TEXT DEFAULT 'pending',due REAL DEFAULT 0,error TEXT,telegram_message_id INTEGER,
+                job_id TEXT,attachment TEXT);
+            CREATE TABLE IF NOT EXISTS reactions(
+                chat_id INTEGER,message_id INTEGER,job_id TEXT,desired TEXT,applied TEXT,
+                terminal INTEGER DEFAULT 0,retry INTEGER DEFAULT 0,updated REAL,
+                PRIMARY KEY(chat_id,message_id));
         ''')
+        columns = {r[1] for r in self.db.execute('PRAGMA table_info(outbox)').fetchall()}
+        if 'job_id' not in columns:
+            self.db.execute('ALTER TABLE outbox ADD COLUMN job_id TEXT')
+        if 'attachment' not in columns:
+            self.db.execute('ALTER TABLE outbox ADD COLUMN attachment TEXT')
         self.db.commit()
 
     def get(self, key, default=None):
@@ -94,14 +105,123 @@ class Store:
         with self.lock, self.db:
             self.db.execute('UPDATE jobs SET progress=? WHERE id=?', (text[:1000], identifier))
 
+    def update_job_spec(self, identifier, spec):
+        with self.lock, self.db:
+            self.db.execute('UPDATE jobs SET spec=? WHERE id=?', (json.dumps(spec, ensure_ascii=False), identifier))
+
     def finish(self, identifier, value):
         with self.lock, self.db:
             self.db.execute('UPDATE jobs SET status=?,result=?,finished=? WHERE id=?', (value['status'], json.dumps(value, ensure_ascii=False), time.time(), identifier))
             self.db.execute('DELETE FROM resources WHERE job=?', (identifier,))
 
-    def notify(self, key, chat, text, reply=None):
+    def notify(self, key, chat, text, reply=None, *, job_id=None, attachment=None):
+        attachment_json = json.dumps(attachment, ensure_ascii=False) if attachment else None
         with self.lock, self.db:
-            self.db.execute('INSERT OR IGNORE INTO outbox(event_key,chat_id,message_id,text) VALUES(?,?,?,?)', (key, chat, reply, text[:3900]))
+            self.db.execute(
+                'INSERT OR IGNORE INTO outbox(event_key,chat_id,message_id,text,job_id,attachment) VALUES(?,?,?,?,?,?)',
+                (key, chat, reply, str(text or '')[:3900], job_id, attachment_json),
+            )
+
+    def job_delivery_statuses(self, job_id):
+        with self.lock:
+            return [r[0] for r in self.db.execute('SELECT status FROM outbox WHERE job_id=?', (job_id,)).fetchall()]
+
+    def set_reaction_intent(self, chat_id, message_id, emoji, *, job_id='', terminal=False):
+        if not chat_id or not message_id:
+            return False
+        with self.lock, self.db:
+            row = self.db.execute(
+                'SELECT job_id,desired,applied,terminal,retry FROM reactions WHERE chat_id=? AND message_id=?',
+                (chat_id, message_id),
+            ).fetchone()
+            if row and row['terminal'] and not terminal:
+                return False
+            if row and row['desired'] == emoji and row['applied'] == emoji and not row['retry']:
+                return False
+            applied = row['applied'] if row else ''
+            self.db.execute(
+                'INSERT OR REPLACE INTO reactions(chat_id,message_id,job_id,desired,applied,terminal,retry,updated) VALUES(?,?,?,?,?,?,0,?)',
+                (chat_id, message_id, job_id or (row['job_id'] if row else ''), emoji, applied, 1 if terminal else 0, time.time()),
+            )
+            return True
+
+    def mark_reaction_result(self, chat_id, message_id, emoji, *, ok: bool, permanent_error: bool = False):
+        if not chat_id or not message_id:
+            return
+        with self.lock, self.db:
+            row = self.db.execute(
+                'SELECT desired,terminal FROM reactions WHERE chat_id=? AND message_id=?',
+                (chat_id, message_id),
+            ).fetchone()
+            if not row or row['desired'] != emoji:
+                return
+            if ok:
+                if row['terminal']:
+                    self.db.execute('DELETE FROM reactions WHERE chat_id=? AND message_id=?', (chat_id, message_id))
+                else:
+                    self.db.execute(
+                        'UPDATE reactions SET applied=?,retry=0,updated=? WHERE chat_id=? AND message_id=?',
+                        (emoji, time.time(), chat_id, message_id),
+                    )
+            elif permanent_error:
+                if row['terminal']:
+                    self.db.execute('DELETE FROM reactions WHERE chat_id=? AND message_id=?', (chat_id, message_id))
+                else:
+                    self.db.execute('UPDATE reactions SET retry=0,updated=? WHERE chat_id=? AND message_id=?', (time.time(), chat_id, message_id))
+            else:
+                self.db.execute('UPDATE reactions SET retry=1,updated=? WHERE chat_id=? AND message_id=?', (time.time(), chat_id, message_id))
+
+    def pending_reaction_retries(self, limit=20):
+        with self.lock:
+            rows = self.db.execute(
+                'SELECT chat_id,message_id,job_id,desired,terminal FROM reactions WHERE retry=1 ORDER BY updated LIMIT ?',
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def prune_jobs_cache(self, jobs_root: Path, *, incoming_bytes: int = 0, max_cache_mb: int = 512, max_jobs: int = 100) -> list[str]:
+        if not jobs_root.is_dir():
+            return []
+        with self.lock:
+            protected = {
+                r[0] for r in self.db.execute(
+                    "SELECT id FROM jobs WHERE status IN ('queued','running','push_pending','uncertain')"
+                ).fetchall()
+            }
+            protected.update(
+                r[0] for r in self.db.execute(
+                    "SELECT DISTINCT job_id FROM outbox WHERE job_id IS NOT NULL AND status IN ('pending','retry','sending')"
+                ).fetchall()
+            )
+            created_map = {
+                r[0]: float(r[1] or 0)
+                for r in self.db.execute('SELECT id,created FROM jobs').fetchall()
+            }
+        entries = []
+        total_bytes = 0
+        for folder in jobs_root.iterdir():
+            if not folder.is_dir():
+                continue
+            try:
+                size = sum(f.stat().st_size for f in folder.rglob('*') if f.is_file())
+                mtime = folder.stat().st_mtime
+            except OSError:
+                continue
+            total_bytes += size
+            created = created_map.get(folder.name, mtime)
+            entries.append((created, folder.name, folder, size))
+        total_count = len(entries)
+        evictable = [item for item in sorted(entries, key=lambda x: x[0]) if item[1] not in protected]
+        max_bytes = max(1, int(max_cache_mb)) * 1024 * 1024
+        max_jobs = max(1, int(max_jobs))
+        removed = []
+        while evictable and (total_bytes + max(0, int(incoming_bytes)) > max_bytes or total_count >= max_jobs):
+            _, job_id, folder, size = evictable.pop(0)
+            shutil.rmtree(folder, ignore_errors=True)
+            total_bytes = max(0, total_bytes - size)
+            total_count = max(0, total_count - 1)
+            removed.append(job_id)
+        return removed
 
     def take_notification(self):
         with self.lock, self.db:

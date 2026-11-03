@@ -72,6 +72,27 @@ class Registry:
                     resources = spec.get('resources', [])
                     if not isinstance(resources, list) or any(not isinstance(r, str) or not re.fullmatch(r'[a-z0-9:_-]{1,80}', r) for r in resources):
                         raise ValueError('资源锁格式无效')
+                    if 'input_files' in spec:
+                        in_files = spec['input_files']
+                        if not isinstance(in_files, dict) or type(in_files.get('required', False)) is not bool:
+                            raise ValueError('input_files 格式无效')
+                        kinds = in_files.get('kinds', ['document'])
+                        if not isinstance(kinds, list) or not kinds or any(k not in ('document', 'photo') for k in kinds):
+                            raise ValueError('input_files.kinds 仅支持 document 或 photo')
+                        exts = in_files.get('extensions', [])
+                        if not isinstance(exts, list) or any(not isinstance(e, str) or not re.fullmatch(r'\.[A-Za-z0-9_+-]{1,16}', e) for e in exts):
+                            raise ValueError('input_files.extensions 需以点号开头')
+                        max_mb = in_files.get('max_size_mb', 2000)
+                        if type(max_mb) is not int or not 1 <= max_mb <= 2000:
+                            raise ValueError('input_files.max_size_mb 范围 1–2000 MB')
+                    if 'output_files' in spec:
+                        out_files = spec['output_files']
+                        if not isinstance(out_files, dict):
+                            raise ValueError('output_files 格式无效')
+                        max_cnt = out_files.get('max_count', 10)
+                        max_out_mb = out_files.get('max_size_mb', 2000)
+                        if type(max_cnt) is not int or not 1 <= max_cnt <= 20 or type(max_out_mb) is not int or not 1 <= max_out_mb <= 2000:
+                            raise ValueError('output_files 范围：max_count 1–20，max_size_mb 1–2000 MB')
                 names = manifest.get('files', [entry])
                 if not isinstance(names, list) or not names or len(names) > 200 or entry not in names:
                     raise ValueError('files 需要包含入口，最多 200 个文件')
@@ -118,6 +139,8 @@ class Registry:
         job_dir = contained(self.layout.runtime / 'jobs', job_id)
         code = job_dir / 'code'
         code.mkdir(parents=True, exist_ok=False)
+        (job_dir / 'inputs').mkdir(parents=True, exist_ok=True)
+        (job_dir / 'outputs').mkdir(parents=True, exist_ok=True)
         for name, data in plugin.files.items():
             path = contained(code, name)
             path.parent.mkdir(parents=True, exist_ok=True)

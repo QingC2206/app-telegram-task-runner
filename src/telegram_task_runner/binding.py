@@ -51,14 +51,26 @@ def permitted_message(config, message):
 
 def parse_command(text, username):
     parts = str(text).strip().split(maxsplit=1)
+    if not parts:
+        return None
+    bot_mention = '@' + str(username).lower()
+    if parts[0].lower() == bot_mention:
+        if len(parts) < 2:
+            return None
+        parts = parts[1].strip().split(maxsplit=1)
     if not parts or not parts[0].startswith('/'):
         return None
     name, sep, target = parts[0][1:].partition('@')
-    if sep and target.lower() != username.lower():
+    if sep and target.lower() != str(username).lower():
         return None
     if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,31}', name):
         return None
-    return name.lower(), parts[1].strip() if len(parts) == 2 else ''
+    argument = parts[1].strip() if len(parts) == 2 else ''
+    if argument.startswith('@'):
+        arg_parts = argument.split(maxsplit=1)
+        if arg_parts[0].lower() == bot_mention:
+            argument = arg_parts[1].strip() if len(arg_parts) == 2 else ''
+    return name.lower(), argument
 
 
 def binding_candidate(update, username, challenge):
