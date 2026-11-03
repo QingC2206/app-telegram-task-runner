@@ -1,0 +1,16 @@
+{
+  "api_version": 1,
+  "id": "hello",
+  "version": "1.0.0",
+  "entrypoint": "main.py",
+  "files": ["main.py"],
+  "enabled": true,
+  "commands": {
+    "hello": {
+      "description": "插件接口示例：问候",
+      "mode": "query",
+      "permission": "view",
+      "timeout_seconds": 15
+    }
+  }
+}

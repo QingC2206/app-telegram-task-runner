@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Private business repositories and all machine-local data.
+/plugins/
+/runtime/

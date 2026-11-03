@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "app-telegram-task-runner"
+version = "0.1.0"
+description = "Run trusted local tasks and private plugins from Telegram"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["keyring>=25,<26; sys_platform != 'win32'"]
+
+[project.scripts]
+telegram-task-runner = "telegram_task_runner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
