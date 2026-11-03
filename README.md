@@ -35,7 +35,7 @@ git clone https://github.com/QingC2206/app-telegram-task-runner.git
 cd app-telegram-task-runner
 ```
 
-下面先用公开的 `hello` 插件验证完整流程。`plugins/` 与 `runtime/` 会由准备命令创建。
+下面先用公开的 `hello` 插件验证完整流程。仓库通过 `plugins/.gitkeep` 保留插件目录，`runtime/` 由准备命令创建。
 
 ### Windows PowerShell
 
@@ -120,7 +120,8 @@ Telegram 群管理员身份不自动获得应用管理员权限。授权或撤�
 app-telegram-task-runner/
   src/telegram_task_runner/        # 公共宿主
   examples/plugins/hello/          # 公开示例
-  plugins/                        # 主仓库 Git 忽略
+  plugins/                        # 只跟踪占位文件，插件内容 Git 忽略
+    .gitkeep                      # 随宿主仓库保留目录
     your_private_plugin/          # 可独立 clone 私有仓库
       plugin.json
       main.py
@@ -172,7 +173,7 @@ git pull --ff-only origin main
 .\run.ps1 doctor --online
 ```
 
-私有插件在各自目录更新，宿主自动检测新版本。`plugins/` 和 `runtime/` 继续保留在本机，不随宿主提交。
+私有插件在各自目录更新，宿主自动检测新版本。私有插件内容和 `runtime/` 继续保留在本机，不随宿主提交。
 
 ## 状态、数据与恢复
 
