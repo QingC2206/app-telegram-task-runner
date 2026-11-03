@@ -52,7 +52,7 @@ def handle(request, ctx):
     return result("你好，" + name, data={"job_id": ctx.job_id})
 ```
 
-`request` 包含 `command`、`argument`、`user_id`、`chat_id`、`message_id`。权限已由宿主在受理和任务开始时检查；参数由插件继续按自身业务规则验证。使用固定程序路径和参数列表调用外部工具，避免把聊天原文拼成 shell 命令。
+`request` 包含 `command`、`argument`、`user_id`、`chat_id`、`message_id`。`chat_id` 是本次发起命令的聊天，可以是绑定群聊或管理员私聊；插件入口和返回格式相同，宿主负责将结果投递到原聊天。权限已由宿主在受理和任务开始时检查；参数由插件继续按自身业务规则验证。使用固定程序路径和参数列表调用外部工具，避免把聊天原文拼成 shell 命令。
 
 `ctx` 提供：
 

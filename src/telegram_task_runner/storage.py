@@ -70,9 +70,13 @@ class Store:
             row = self.db.execute('SELECT * FROM jobs WHERE id=?', (identifier,)).fetchone()
             return dict(row) if row else None
 
-    def jobs(self, limit=10):
+    def jobs(self, limit=10, *, chat_id=None):
         with self.lock:
-            return [dict(r) for r in self.db.execute('SELECT * FROM jobs ORDER BY created DESC LIMIT ?', (limit,))]
+            if chat_id is None:
+                rows = self.db.execute('SELECT * FROM jobs ORDER BY created DESC LIMIT ?', (limit,))
+            else:
+                rows = self.db.execute('SELECT * FROM jobs WHERE chat_id=? ORDER BY created DESC LIMIT ?', (chat_id,limit))
+            return [dict(r) for r in rows]
 
     def claim(self, mode):
         with self.lock, self.db:
@@ -115,7 +119,7 @@ class Store:
         with self.lock, self.db:
             active = self.db.execute("SELECT id FROM jobs WHERE status='running'").fetchall()
             for row in active:
-                self.finish(row[0], {'ok': False, 'status': 'uncertain', 'message': '服务中断，结果需要核对；未自动重跑。请查看任务日志；加密提交已生成时用 /core_retry_push。', 'data': {}})
+                self.finish(row[0], {'ok': False, 'status': 'uncertain', 'message': '服务中断，结果需要核对；未自动重跑。请查看任务日志，并按插件提供的恢复方式处理。', 'data': {}})
             self.db.execute('DELETE FROM resources')
             self.db.execute("UPDATE outbox SET status='unknown',error='服务中断，通知投递未确认' WHERE status='sending'")
         return len(active)

@@ -42,11 +42,16 @@ class MenuPublisher:
         public = menus[None]
         members = set(config['allowed_user_ids']) if chat_id < 0 else set()
         known = set(self.store.get('command_menu_members', []))
+        private_chats = (set(self.store.get('admin_private_chats', [])) & set(config['admin_user_ids'])) - {chat_id}
+        known_private = set(self.store.get('command_menu_private_chats', []))
         if members - known:
             known.update(members)
             # Record intent before networking: even an ambiguous API response can
             # create a scope that must be removed after a later revocation.
             self.store.set('command_menu_members', sorted(known))
+        if private_chats - known_private:
+            known_private.update(private_chats)
+            self.store.set('command_menu_private_chats', sorted(known_private))
         actions = [('setMyCommands', {'type': 'chat', 'chat_id': chat_id},
                     public if chat_id < 0 else menus[chat_id])]
         if chat_id < 0:
@@ -56,6 +61,10 @@ class MenuPublisher:
                        for user_id in sorted(known - members))
         actions.extend(('setMyCommands', {'type': 'chat_member', 'chat_id': chat_id, 'user_id': user_id},
                         menus[user_id]) for user_id in sorted(members))
+        actions.extend(('deleteMyCommands', {'type': 'chat', 'chat_id': identifier}, None)
+                       for identifier in sorted(known_private - private_chats - {chat_id}))
+        actions.extend(('setMyCommands', {'type': 'chat', 'chat_id': identifier}, menus[identifier])
+                       for identifier in sorted(private_chats))
         errors = []
         for method, scope, commands in actions:
             key = json.dumps(scope, sort_keys=True)
@@ -74,8 +83,12 @@ class MenuPublisher:
                     break
                 continue
             if method == 'deleteMyCommands':
-                known.discard(scope['user_id'])
-                self.store.set('command_menu_members', sorted(known))
+                if scope['type'] == 'chat_member':
+                    known.discard(scope['user_id'])
+                    self.store.set('command_menu_members', sorted(known))
+                else:
+                    known_private.discard(scope['chat_id'])
+                    self.store.set('command_menu_private_chats', sorted(known_private))
                 self.signatures.pop(key, None)
             else:
                 self.signatures[key] = signature

@@ -6,6 +6,7 @@
 
 - **私有插件**：自动发现和热加载，可在 Git 忽略目录内 clone 独立的业务仓库。
 - **按权限显示命令**：未授权用户、普通授权用户和应用管理员看到各自可用的菜单。
+- **群聊与管理员私聊并行**：同一套命令和任务队列，回复与结果返回发起聊天。
 - **可追踪执行**：持久化队列、任务状态、进度和结果，查询与长任务分开处理。
 - **用户会话自动启动**：Windows 计划任务、macOS LaunchAgent、Linux systemd 用户服务。
 
@@ -22,7 +23,7 @@
 | Linux | 已解锁的 Secret Service、用户 D-Bus；自动启动需 systemd 用户服务 |
 | 网络 | 执行机可访问 Telegram Bot API；macOS/Linux 安装时需下载 keyring |
 
-每份部署绑定一个机器人和一个群或私人聊天。同一个 Bot Token 同时只由一个轮询进程使用。业务插件需要的 Git 凭据、编译工具和第三方程序由执行机提供。
+每份部署绑定一个机器人和一个主聊天（群或私人聊天），应用管理员可同时私聊该机器人，无需重新绑定。同一个 Bot Token 只由一个轮询进程使用，两种入口共用命令、插件和任务队列。业务插件需要的 Git 凭据、编译工具和第三方程序由执行机提供。
 
 ## 快速开始
 
@@ -82,14 +83,14 @@ macOS 使用 LaunchAgent，Linux 使用 systemd 用户服务；两者默认在�
 
 需要代理时，使用 `run.ps1 setup --proxy http://127.0.0.1:7890`；macOS/Linux 用 `bash run.sh setup --proxy http://127.0.0.1:7890`。使用执行机实际可用的代理地址。完整步骤及重新绑定方式见 [安装与绑定教程](docs/setup.md)。
 
-## 群内使用
+## 群聊与管理员私聊
 
 `机器人名` 替换为 BotFather 创建的用户名，在多人或多机器人群内使用明确命令：
 
 | 命令 | 用途 | 权限 |
 |---|---|---|
-| `/help` | 列出自己可用的命令 | 所有用户 |
-| `/whoami` | 查询自己的数字用户 ID | 所有用户 |
+| `/help` | 列出自己可用的命令 | 绑定聊天用户、管理员私聊 |
+| `/whoami` | 查询自己的数字用户 ID | 绑定聊天用户、管理员私聊 |
 | `/status` | 查询宿主、Telegram 连接和通知状态 | 授权用户 |
 | `/plugins` | 查看插件及自己可用的插件命令 | 授权用户 |
 | `/jobs` | 查看最近任务 | 授权用户 |
@@ -100,7 +101,22 @@ macOS 使用 LaunchAgent，Linux 使用 systemd 用户服务；两者默认在�
 
 例如 `/job@your_task_runner_bot 任务编号`。同一群内的消息及回复遵循群聊本身的可见性，按权限过滤菜单不会隐藏已有的群消息。
 
-只有绑定的群和授权用户可以执行任务。初次绑定的人作为管理员；同事在群内发送 `/whoami@机器人名` 获取自身 ID，由管理员 `/allow@机器人名 用户ID` 授权。`/users` 查看授权列表，`/revoke 用户ID` 撤销普通用户。管理员身份通过本机 `setup` 管理。
+绑定聊天中的授权用户和应用管理员私聊可以执行任务。初次绑定的人作为管理员；同事在群内发送 `/whoami@机器人名` 获取自身 ID，由管理员 `/allow@机器人名 用户ID` 授权。`/users` 查看授权列表，`/revoke 用户ID` 撤销普通用户。管理员身份通过本机 `setup` 管理。
+
+### 管理员私聊
+
+管理员打开同一个机器人的私聊，点击 **Start** 或发送 `/start`，即可直接使用命令：
+
+```text
+/help
+/status
+/plugins
+/jobs
+```
+
+私聊命令无需附加 `@机器人名`，可执行的插件和权限与群内一致。保留现有群绑定即可，普通授权群成员不会因此获得额外的私聊执行权限。
+
+命令回复、排队通知、执行结果和错误均返回发起聊天；群中触发的任务回复群，私聊触发的任务回复私聊。`/jobs` 和 `/job` 只查询当前聊天的任务，队列和资源锁仍由所有入口共享。首次私聊后会自动注册管理员私聊菜单，插件更新及管理员身份变更后同步刷新。
 
 群内输入 `/` 时，宿主按用户权限注册不同的命令菜单；`/help` 和 `/plugins` 同样过滤命令：
 
@@ -215,7 +231,7 @@ git pull --ff-only origin main
 .\run.ps1 doctor --online
 ```
 
-macOS/Linux 测试命令为 `runtime/venv/bin/python -m unittest discover -s tests -v`。GitHub Actions 在 Windows、macOS 和 Ubuntu 上运行同一套公共测试，当前 39 项测试已通过。测试范围与平台验收方法见 [验证说明](docs/validation.md)；CI 不包含业务插件或真实部署验收。
+macOS/Linux 测试命令为 `runtime/venv/bin/python -m unittest discover -s tests -v`。公共测试套件包含 47 项，GitHub Actions 在 Windows、macOS 和 Ubuntu 上运行同一套测试。测试范围与平台验收方法见 [验证说明](docs/validation.md)；CI 不包含业务插件或真实部署验收。
 
 ## 许可证与来源
 

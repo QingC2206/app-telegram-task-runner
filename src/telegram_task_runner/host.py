@@ -6,7 +6,7 @@ import threading
 import time
 import traceback
 import uuid
-from .binding import load_config, parse_command, permitted
+from .binding import load_config, parse_command, permitted, permitted_chat, permitted_message
 from .executor import execute
 from .locking import FileLock, BotLock
 from .menus import MenuPublisher, commands_for
@@ -57,8 +57,9 @@ class Host:
                 self.layout.log('Health snapshot failed: ' + str(error),self.api.token)
             self.stop.wait(5)
 
-    def reply(self, key, text, message_id=None):
-        self.store.notify(key, self.config['chat_id'], redact(text, self.api.token), message_id)
+    def reply(self, key, text, message_id=None, *, chat_id=None):
+        target = self.config['chat_id'] if chat_id is None else chat_id
+        self.store.notify(key, target, redact(text, self.api.token), message_id)
 
     def menu(self, user_id=None):
         with self.registry_lock:
@@ -67,45 +68,52 @@ class Host:
     def handle(self, update):
         message = update.get('message') or {}
         user, chat = message.get('from') or {}, message.get('chat') or {}
-        if chat.get('id') != self.config['chat_id'] or message.get('sender_chat') or user.get('is_bot') or type(user.get('id')) is not int:
+        if not permitted_message(self.config, message):
             return
+        if chat['type'] == 'private' and permitted(self.config, user['id'], 'admin'):
+            seen = set(self.store.get('admin_private_chats', []))
+            if chat['id'] not in seen:
+                self.store.set('admin_private_chats', sorted(seen | {chat['id']}))
+                self.menu_refresh.set()
         parsed = parse_command(message.get('text', ''), self.config['bot_username'])
         if not parsed:
             return
         command, argument = parsed
         key, source = 'update:' + str(update['update_id']), message.get('message_id')
+        def reply(text):
+            self.reply(key, text, source, chat_id=chat['id'])
         if time.time() - message.get('date', 0) > self.config.get('command_max_age_seconds', 900):
             if permitted(self.config, user['id']):
-                self.reply(key, '这条命令已过期，请重新发送。', source)
+                reply('这条命令已过期，请重新发送。')
             return
         if command == 'whoami':
-            self.reply(key, f"你的用户 ID：{user['id']}\n当前群/聊天 ID：{chat['id']}", source)
+            reply(f"你的用户 ID：{user['id']}\n当前群/聊天 ID：{chat['id']}")
             return
         if command in ('start','help'):
             lines = ['Telegram Task Runner', '以下为你当前可用的命令。']
             if not permitted(self.config, user['id']):
                 lines.append('执行任务需由管理员授权；先用 /whoami 获取自己的用户 ID。')
             lines.extend('/' + item['command'] + ' — ' + item['description'] for item in self.menu(user['id']))
-            self.reply(key, '\n'.join(lines), source); return
+            reply('\n'.join(lines)); return
         if not permitted(self.config, user['id']):
             return
         if command in ('allow', 'revoke', 'users'):
             if not permitted(self.config, user['id'], 'admin'):
-                self.reply(key, '此命令需要管理员权限。', source); return
+                reply('此命令需要管理员权限。'); return
             if command == 'users':
-                self.reply(key, '授权用户：' + ', '.join(map(str, self.config['allowed_user_ids'])) + '\n管理员：' + ', '.join(map(str, self.config['admin_user_ids'])), source); return
+                reply('授权用户：' + ', '.join(map(str, self.config['allowed_user_ids'])) + '\n管理员：' + ', '.join(map(str, self.config['admin_user_ids']))); return
             if not argument.isdigit() or int(argument) <= 0:
-                self.reply(key, '用法：/' + command + ' 用户ID', source); return
+                reply('用法：/' + command + ' 用户ID'); return
             identifier = int(argument)
             if command == 'revoke' and identifier in self.config['admin_user_ids']:
-                self.reply(key, '管理员授权请通过本机 setup 管理。', source); return
+                reply('管理员授权请通过本机 setup 管理。'); return
             users = set(self.config['allowed_user_ids'])
             users.add(identifier) if command == 'allow' else users.discard(identifier)
             config = {**self.config, 'allowed_user_ids': sorted(users)}
             atomic_json(self.layout.config, config)
             self.config = config
             self.menu_refresh.set()
-            self.reply(key, '已更新授权用户。', source); return
+            reply('已更新授权用户。'); return
         if command == 'status':
             health = self.health_snapshot()
             connection = {'online':'正常','retrying':'正在重连','connecting':'连接中','stale':'长时间未成功'}[health['telegram']['state']]
@@ -117,7 +125,7 @@ class Host:
             text += '\n工作线程：' + ('异常 '+', '.join(unhealthy) if unhealthy else '正常')
             text += '\n任务状态：' + json.dumps(self.store.counts(),ensure_ascii=False) + '\n插件数量：' + str(len(self.registry.plugins))
             text += f"\n通知：已发送 {notices.get('sent',0)}，待发送 {notices.get('pending',0)+notices.get('retry',0)}，未确认 {notices.get('unknown',0)}，失败 {notices.get('failed',0)}"
-            self.reply(key,text,source); return
+            reply(text); return
         if command == 'plugins':
             with self.registry_lock:
                 lines = []
@@ -129,25 +137,25 @@ class Host:
                 text = '\n'.join(lines) or '没有你可用的插件命令。'
                 if self.registry.errors:
                     text += '\n\n未加载：\n' + '\n'.join(k + ': ' + v for k,v in self.registry.errors.items())
-            self.reply(key, text, source); return
+            reply(text); return
         if command == 'jobs':
-            self.reply(key, '\n'.join(f"{j['id']} /{j['command']} {j['status']}" for j in self.store.jobs()) or '还没有任务。', source); return
+            reply('\n'.join(f"{j['id']} /{j['command']} {j['status']}" for j in self.store.jobs(chat_id=chat['id'])) or '还没有任务。'); return
         if command == 'job':
             job = self.store.job(argument.strip())
-            if not job:
-                self.reply(key, '没有找到这个任务，请先 /jobs。', source); return
+            if not job or job['chat_id'] != chat['id']:
+                reply('没有找到这个任务，请先 /jobs。'); return
             text = f"任务：{job['id']}\n命令：/{job['command']}\n状态：{job['status']}\n进度：{job['progress'] or '等待执行'}"
             if job['result']:
                 text += '\n\n' + json.loads(job['result'])['message']
-            self.reply(key, text, source); return
+            reply(text); return
         with self.registry_lock:
             self.registry.discover()
             target = self.registry.commands.get(command)
             if not target:
-                self.reply(key, '无法识别命令，请 /help 或 /plugins。', source); return
+                reply('无法识别命令，请 /help 或 /plugins。'); return
             plugin, spec = target
             if not permitted(self.config, user['id'], spec['permission']):
-                self.reply(key, '没有执行此命令的权限。', source); return
+                reply('没有执行此命令的权限。'); return
             if self.store.for_update(update['update_id']):
                 return
             identifier = uuid.uuid4().hex[:16]
@@ -158,14 +166,14 @@ class Host:
                    'spec': {**spec, 'config': plugin.config, 'entrypoint': plugin.manifest.get('entrypoint','main.py'),
                             'timeout_seconds': spec.get('timeout_seconds', 30 if spec['mode']=='query' else 3600)}}
             self.store.add_job(job)
-            self.reply('job:' + identifier + ':queued', '⏳ 已接受任务 ' + identifier + '\n/' + command, source)
+            self.reply('job:' + identifier + ':queued', '⏳ 已接受任务 ' + identifier + '\n/' + command, source, chat_id=chat['id'])
 
     def complete_notice(self, job):
         if not job['result']:
             return
         value = json.loads(job['result'])
         prefix = '✅' if value['ok'] else ('⚠️' if value['status'] in ('uncertain','push_pending') else '❌')
-        self.reply('job:' + job['id'] + ':final', f"{prefix} 任务 {job['id']}\n" + value['message'], job['message_id'])
+        self.reply('job:' + job['id'] + ':final', f"{prefix} 任务 {job['id']}\n" + value['message'], job['message_id'], chat_id=job['chat_id'])
 
     def work(self, mode):
         while not self.stop.is_set():
@@ -173,7 +181,7 @@ class Host:
             if not job:
                 self.stop.wait(0.5); continue
             try:
-                if job['chat_id'] != self.config['chat_id'] or not permitted(self.config, job['user_id'], job['permission']):
+                if not permitted_chat(self.config, job['chat_id'], job['user_id']) or not permitted(self.config, job['user_id'], job['permission']):
                     raise RuntimeError('任务开始前授权已撤销，已停止执行。')
                 def progress(text):
                     self.store.progress(job['id'], redact(text, self.api.token))
@@ -191,8 +199,8 @@ class Host:
         value = self.store.take_notification()
         if not value:
             return False
-        if value['chat_id'] != self.config['chat_id']:
-            self.store.delivered(value['id'], 'failed', error='聊天绑定已改变'); return True
+        if not permitted_chat(self.config, value['chat_id'], value['chat_id'] if value['chat_id'] > 0 else None):
+            self.store.delivered(value['id'], 'failed', error='聊天入口已失效或授权已撤销'); return True
         try:
             sent = self.api.send(value['chat_id'], value['text'], value['message_id'])
             self.store.delivered(value['id'], 'sent', telegram_id=sent['message_id'])
@@ -262,8 +270,8 @@ class Host:
                                 self.layout.log('Command rejected: ' + str(error), self.api.token)
                                 message = update.get('message') or {}
                                 sender = message.get('from') or {}
-                                if (message.get('chat') or {}).get('id') == self.config['chat_id'] and not message.get('sender_chat') and not sender.get('is_bot') and permitted(self.config,sender.get('id')):
-                                    self.reply('update:'+str(update['update_id']), '命令受理失败：'+redact(error,self.api.token),message.get('message_id'))
+                                if permitted_message(self.config, message) and permitted(self.config,sender.get('id')):
+                                    self.reply('update:'+str(update['update_id']), '命令受理失败：'+redact(error,self.api.token),message.get('message_id'),chat_id=message['chat']['id'])
                             self.store.handled(update['update_id'])
                         updates = self.api.call('getUpdates', {'offset':self.store.get('offset',0), 'timeout':20, 'limit':50, 'allowed_updates':['message']}, timeout=30)
                         for update in updates or []:
@@ -284,6 +292,7 @@ class Host:
                         self.stop.wait(min(30, 2 ** min(failures,5)))
             finally:
                 self.stop.set()
+                self.menu_refresh.set()
                 for thread in self.workers:
                     thread.join(timeout=45)
                 atomic_json(self.layout.runtime / 'health.json',self.health_snapshot('stopped'))

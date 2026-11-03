@@ -16,12 +16,13 @@ macOS / Linux：
 runtime/venv/bin/python -m unittest discover -s tests -v
 ```
 
-[GitHub Actions](https://github.com/QingC2206/app-telegram-task-runner/actions/workflows/tests.yml) 在 Windows、macOS 和 Ubuntu 上运行公共测试。当前套件包含 39 项；仅适用于特定系统的测试在其他系统上按声明跳过。
+[GitHub Actions](https://github.com/QingC2206/app-telegram-task-runner/actions/workflows/tests.yml) 在 Windows、macOS 和 Ubuntu 上运行公共测试。当前套件包含 47 项；仅适用于特定系统的测试在其他系统上按声明跳过。
 
 覆盖范围：
 
 - 聊天和用户授权、命令目标、匿名或机器人发送者、过期命令及授权管理。
 - 按权限分发菜单、帮助和插件清单，授权变更、重启清理与 API 重试。
+- 群聊与管理员私聊并行受理、同源回复与异常通知、会话任务查询隔离、跨入口资源锁和私聊权限复检。
 - 插件发现、热更新、平台声明、冲突处理，以及代码和配置快照。
 - 消息去重、持久化收件箱、查询与长任务分离、资源队列和中断恢复。
 - 子进程超时清理、插件异常、环境变量白名单及通知投递状态。
@@ -36,9 +37,10 @@ runtime/venv/bin/python -m unittest discover -s tests -v
 
 1. 前台宿主可接受群内命令，返回示例任务结果。
 2. 未授权用户、授权用户和管理员的菜单符合各自权限。
-3. 服务启动后可用 `doctor --online` 核对连接，用群内 `/status` 查看运行状态。
-4. 使用当前用户的原生自动启动方式验证登录、注销、重启和网络恢复行为。
-5. 核对队列与通知状态后再重启服务，确认已完成任务不会自动重跑。
+3. 管理员私聊 `/start` 后可执行相同示例，结果返回私聊；群聊和私聊各自只查询本聊天的任务。
+4. 服务启动后可用 `doctor --online` 核对连接，用 `/status` 查看运行状态。
+5. 使用当前用户的原生自动启动方式验证登录、注销、重启和网络恢复行为。
+6. 核对队列与通知状态后再重启服务，确认已完成任务不会自动重跑。
 
 平台原生服务和系统钥匙串需要在实际部署系统验收。自动化测试通过不等于所有桌面会话环境均完成验收。
 

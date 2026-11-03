@@ -29,6 +29,26 @@ def permitted(config, user, permission='execute'):
     return user in users
 
 
+def permitted_chat(config, chat_id, user_id=None):
+    if type(chat_id) is not int or chat_id == 0:
+        return False
+    if chat_id > 0 and (type(user_id) is not int or user_id != chat_id):
+        return False
+    return chat_id == config['chat_id'] or (chat_id > 0 and permitted(config, user_id, 'admin'))
+
+
+def permitted_message(config, message):
+    user, chat = message.get('from') or {}, message.get('chat') or {}
+    if message.get('sender_chat') or user.get('is_bot') or type(user.get('id')) is not int or user['id'] <= 0:
+        return False
+    chat_id = chat.get('id')
+    if type(chat_id) is not int:
+        return False
+    if chat.get('type') == 'private':
+        return chat_id > 0 and permitted_chat(config, chat_id, user['id'])
+    return chat.get('type') in ('group', 'supergroup') and chat_id < 0 and permitted_chat(config, chat_id, user['id'])
+
+
 def parse_command(text, username):
     parts = str(text).strip().split(maxsplit=1)
     if not parts or not parts[0].startswith('/'):

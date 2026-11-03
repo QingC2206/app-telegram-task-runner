@@ -91,6 +91,11 @@ class Sandbox(unittest.TestCase):
     def update(self, text='/demo@TestRunnerBot', user=1, chat=-100, identifier=10, **extra):
         return {'update_id':identifier,'message':{'message_id':identifier,'date':int(time.time()),'chat':{'id':chat,'type':'supergroup'},'from':{'id':user},'text':text,**extra}}
 
+    def private_update(self, text='/demo', user=1, identifier=10, **extra):
+        update = self.update(text,user=user,chat=user,identifier=identifier,**extra)
+        update['message']['chat']['type'] = 'private'
+        return update
+
 
 class RegistryTests(Sandbox):
     def test_private_git_folder_is_not_loaded_or_snapshotted(self):
@@ -320,6 +325,147 @@ class HostTests(Sandbox):
         self.assertTrue(any('original' in text for _,text,_ in self.api.sent))
 
 
+class PrivateChatTests(Sandbox):
+    def test_admin_builtin_commands_reply_to_their_origin_in_both_chats(self):
+        host = self.make_host()
+        commands = ('/start','/help','/whoami','/status','/plugins','/jobs','/job missing',
+                    '/users','/allow 3','/allow invalid','/revoke 3','/revoke 1','/unknown')
+        identifier = 100
+        for command in commands:
+            for private in (False,True):
+                update = (self.private_update if private else self.update)(command,identifier=identifier)
+                update['message']['message_id'] = 7
+                host.handle(update)
+                self.assertTrue(host.deliver_one())
+                self.assertEqual(self.api.sent[-1][0],1 if private else -100)
+                self.assertEqual(self.api.sent[-1][2],7)
+                identifier += 1
+        self.assertEqual(len(self.api.sent),len(commands)*2)
+        self.assertEqual(host.config['chat_id'],-100)
+
+    def test_other_private_users_chats_and_invalid_senders_are_rejected(self):
+        self.plugin(); host = self.make_host()
+        forged = self.private_update(); forged['message']['chat']['id'] = 2
+        wrong_type = self.private_update(); wrong_type['message']['chat']['type'] = 'channel'
+        updates = (self.private_update(user=2),self.private_update(user=99),self.update(chat=-999),
+                   self.update(chat=1),forged,wrong_type,
+                   self.private_update(**{'from':{'id':1,'is_bot':True}}),
+                   self.private_update(sender_chat={'id':-100}))
+        for update in updates:
+            host.handle(update)
+        self.assertFalse(host.store.jobs())
+        self.assertFalse(host.store.notification_counts())
+        self.assertFalse(host.store.get('admin_private_chats',[]))
+
+    def test_chats_share_resources_and_query_only_their_own_jobs(self):
+        self.plugin(commands={'demo':{'description':'demo','mode':'job','permission':'execute','resources':['shared_workspace']}})
+        host = self.make_host(); host.handle(self.private_update())
+        private_job = host.store.jobs(chat_id=1)[0]
+        for identifier in range(11,23):
+            host.handle(self.update(user=2,identifier=identifier))
+        group_jobs = host.store.jobs(100,chat_id=-100)
+        self.assertEqual(len(group_jobs),12)
+        self.assertEqual(len(host.store.jobs(chat_id=1)),1)
+        self.assertEqual(host.store.claim('job')['id'],private_job['id'])
+        self.assertIsNone(host.store.claim('job'))
+        host.store.finish(private_job['id'],{'status':'succeeded','ok':True,'message':'private result','data':{}})
+        self.assertEqual(host.store.claim('job')['chat_id'],-100)
+        while host.deliver_one():
+            pass
+        host.handle(self.private_update('/jobs',identifier=30)); host.deliver_one()
+        text = self.api.sent[-1][1]
+        self.assertIn(private_job['id'],text)
+        self.assertTrue(all(job['id'] not in text for job in group_jobs))
+        host.handle(self.update('/jobs',identifier=31)); host.deliver_one()
+        self.assertNotIn(private_job['id'],self.api.sent[-1][1])
+        host.handle(self.update('/job '+private_job['id'],identifier=32)); host.deliver_one()
+        self.assertNotIn('private result',self.api.sent[-1][1])
+        self.assertNotIn(private_job['id'],self.api.sent[-1][1])
+        host.handle(self.private_update('/job '+group_jobs[0]['id'],identifier=33)); host.deliver_one()
+        self.assertNotIn(group_jobs[0]['id'],self.api.sent[-1][1])
+        host.handle(self.private_update('/job '+private_job['id'],identifier=34)); host.deliver_one()
+        self.assertIn('private result',self.api.sent[-1][1])
+
+    def test_private_job_rechecks_admin_before_execution_and_delivery(self):
+        self.plugin(); host = self.make_host(); host.handle(self.private_update())
+        job = host.store.jobs()[0]
+        host.config = {**host.config,'admin_user_ids':[2]}
+        original = host.store.claim
+        def claim(mode):
+            value = original(mode)
+            if value is None:
+                host.stop.set()
+            return value
+        with patch.object(host.store,'claim',side_effect=claim), patch('telegram_task_runner.host.execute') as execute_mock:
+            host.work('job')
+        execute_mock.assert_not_called()
+        self.assertEqual(host.store.job(job['id'])['status'],'failed')
+        while host.deliver_one():
+            pass
+        self.assertFalse(self.api.sent)
+        self.assertEqual(host.store.notification_counts(),{'failed':2})
+
+    def test_private_job_result_and_notice_survive_restart_without_duplication(self):
+        self.plugin(); host = self.make_host(); host.handle(self.private_update())
+        job = host.store.claim('job')
+        host.store.finish(job['id'],execute(self.layout,job))
+        host.complete_notice(host.store.job(job['id']))
+        while host.deliver_one():
+            pass
+        self.assertEqual(len(self.api.sent),2)
+        self.assertTrue(all(chat == 1 for chat,_,_ in self.api.sent))
+        host.store.close()
+        self.host = Host(self.layout,host.config,self.api)
+        self.assertEqual(self.host.store.recover(),0)
+        self.host.complete_notice(self.host.store.job(job['id']))
+        self.assertFalse(self.host.deliver_one())
+        self.assertEqual(len(self.api.sent),2)
+        self.assertEqual(self.host.store.job(job['id'])['status'],'succeeded')
+
+    def test_full_poll_routes_private_and_group_jobs_and_handler_errors(self):
+        self.plugin(code="from telegram_task_runner.plugin_api import result\ndef handle(request,ctx): return result('done '+str(request['chat_id']))\n")
+        host = self.make_host()
+        updates = [self.private_update('/broken',identifier=100),self.private_update(identifier=101),self.update(identifier=102)]
+        for update in updates[1:]:
+            update['message']['message_id'] = 7
+        state = {'received':False}
+        original_call, original_handle, original_send = self.api.call,host.handle,self.api.send
+        def call(method,payload=None,**options):
+            if method == 'getMe':
+                return {'id':123456,'username':'TestRunnerBot'}
+            if method == 'getWebhookInfo':
+                return {'url':''}
+            if method in ('setMyCommands','deleteMyCommands'):
+                return original_call(method,payload,**options)
+            self.assertEqual(method,'getUpdates')
+            if not state['received']:
+                state['received'] = True
+                return updates
+            host.stop.wait(0.02)
+            return []
+        def handle(update):
+            if update['message']['text'] == '/broken':
+                raise ValueError('simulated handler failure')
+            return original_handle(update)
+        def send(chat,text,reply):
+            value = original_send(chat,text,reply)
+            if sum('done ' in message for _,message,_ in self.api.sent) == 2:
+                host.stop.set()
+            return value
+        self.api.call,self.api.send,host.handle = call,send,handle
+        import threading
+        watchdog = threading.Timer(10,host.stop.set); watchdog.start()
+        try:
+            self.assertEqual(host.run(),0)
+        finally:
+            watchdog.cancel()
+        finals = {(chat,text.splitlines()[-1],reply) for chat,text,reply in self.api.sent if 'done ' in text}
+        self.assertEqual(finals,{(1,'done 1',7),(-100,'done -100',7)})
+        errors = [(chat,text) for chat,text,_ in self.api.sent if 'simulated handler failure' in text]
+        self.assertEqual(len(errors),1)
+        self.assertEqual(errors[0][0],1)
+
+
 class MenuTests(Sandbox):
     def names(self, kind='chat', user=None, chat=-100):
         scope = {'type': kind, 'chat_id': chat}
@@ -445,6 +591,37 @@ class MenuTests(Sandbox):
         self.assertIn('demo',self.names(chat=2))
         self.assertNotIn('allow',self.names(chat=2))
         self.assertTrue(all(payload['scope']['type'] == 'chat' for _,payload in self.api.command_calls))
+
+    def test_admin_private_menu_is_registered_after_contact_and_hot_loads_plugins(self):
+        self.plugin(); host = self.make_host(); host.sync_menus()
+        self.assertFalse(self.names(chat=1))
+        host.handle(self.private_update('/start',user=2))
+        host.sync_menus()
+        self.assertFalse(self.names(chat=2))
+        host.handle(self.private_update('/start',identifier=11))
+        host.sync_menus()
+        self.assertTrue({'demo','allow','users'} <= self.names(chat=1))
+        self.assertEqual(self.names(),{'help','whoami'})
+        self.assertEqual(host.store.get('command_menu_private_chats'),[1])
+        self.plugin('added'); host.sync_menus()
+        self.assertIn('added',self.names(chat=1))
+        self.assertIn('added',self.names('chat_member',1))
+
+    def test_revoked_admin_private_menu_is_cleaned_after_restart(self):
+        self.plugin(); host = self.make_host()
+        host.handle(self.private_update('/start')); host.sync_menus()
+        self.assertIn('allow',self.names(chat=1))
+        host.config = {**host.config,'admin_user_ids':[2]}
+        host.store.close()
+        self.host = Host(self.layout,host.config,self.api)
+        self.host.sync_menus()
+        self.assertFalse(self.names(chat=1))
+        self.assertEqual(self.host.store.get('command_menu_private_chats'),[])
+        self.assertNotIn('allow',self.names('chat_member',1))
+        self.host.handle(self.private_update('/start',user=2,identifier=11))
+        self.host.sync_menus()
+        self.assertIn('allow',self.names(chat=2))
+        self.assertFalse(self.names(chat=1))
 
 
 class PlatformTests(Sandbox):
