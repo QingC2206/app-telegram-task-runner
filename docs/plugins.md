@@ -129,7 +129,7 @@ request["files"] = [
 ### 3. 返回值与回传文件安全校验
 - `result(message, ok=True, data=None, status=None, files=None)` 返回结果文字、结构化数据、状态码及待回传文件列表。
 - 合法状态为 `succeeded`、`failed`、`push_pending`、`uncertain`。失败应 `ok=False`。
-- `files` 可使用 `document(path, name=..., caption=...)` 或 `photo(path, name=..., caption=...)` 构造。**所有回传文件必须位于本次任务的 `ctx.job_dir`（推荐 `ctx.outputs_dir`）内**，宿主强制校验路径包含关系，拒绝回传任务目录外的任意本机文件。
+- `files` 可使用 `document(path, name=..., caption=...)` 或 `photo(path, name=..., caption=...)` 构造。**所有回传文件必须位于本次任务的 `ctx.job_dir`（推荐 `ctx.outputs_dir`）内**，宿主强制校验路径包含关系，拒绝回传任务目录外的任意本机文件。当回传 2–10 个同类型文件且总大小未超单次上限时，宿主会自动调用 `sendMediaGroup` 将多个附件及结果摘要合并至同一个对话气泡发送。
 
 ## 五、 缓存容量管理（Cache GC）与原生表情反馈
 

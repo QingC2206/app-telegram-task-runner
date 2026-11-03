@@ -758,9 +758,27 @@ class FileCacheAndReactionTests(Sandbox):
             })
             return {'message_id': 1000 + len(self.sent_files)}
 
+        self.sent_media_groups = []
+
+        def send_media_group(chat_id, items, *, caption='', reply_to=None, timeout=300):
+            self.sent_media_groups.append({
+                'chat_id': chat_id,
+                'items': [
+                    {
+                        **item,
+                        'bytes': Path(item['path']).read_bytes(),
+                    }
+                    for item in items
+                ],
+                'caption': caption,
+                'reply_to': reply_to,
+            })
+            return [{'message_id': 2000 + idx} for idx in range(len(items))]
+
         self.api.react = react
         self.api.download_file = download_file
         self.api.send_file = send_file
+        self.api.send_media_group = send_media_group
 
     def install_transform_plugin(self):
         code = (
@@ -895,6 +913,52 @@ class FileCacheAndReactionTests(Sandbox):
         self.assertNotIn(job_ids[0], remaining_dirs)
         self.assertIn(job_ids[1], remaining_dirs)
         self.assertIn(job_ids[2], remaining_dirs)
+
+    def test_multi_file_output_uses_single_media_group_message(self):
+        code = (
+            "from telegram_task_runner.plugin_api import document, result\n"
+            "def handle(request, ctx):\n"
+            "    names = ('primary.dll', 'runtime_a.dll', 'runtime_b.exe')\n"
+            "    out = []\n"
+            "    for n in names:\n"
+            "        p = ctx.outputs_dir / n\n"
+            "        p.write_bytes(b'MZ-' + n.encode())\n"
+            "        out.append(document(p, name=n))\n"
+            "    return result('protected bundle ready', files=out)\n"
+        )
+        self.plugin(
+            'bundle',
+            code=code,
+            commands={
+                'bundle_out': {
+                    'description': '多文件合并回发示例',
+                    'mode': 'job',
+                    'permission': 'execute',
+                    'timeout_seconds': 30,
+                    'output_files': {'max_count': 5, 'max_size_mb': 500},
+                }
+            },
+        )
+        host = self.make_host()
+        host.handle(self.private_update('/bundle_out', identifier=88))
+
+        def claim_once(mode):
+            j = Store.claim(host.store, mode)
+            if j is None:
+                host.stop.set()
+            return j
+
+        with patch.object(host.store, 'claim', side_effect=claim_once):
+            host.work('job')
+        while host.deliver_one():
+            pass
+
+        self.assertEqual(len(self.sent_media_groups), 1)
+        self.assertEqual(len(self.sent_files), 0)
+        group = self.sent_media_groups[0]
+        self.assertEqual([item['name'] for item in group['items']], ['primary.dll', 'runtime_a.dll', 'runtime_b.exe'])
+        self.assertIn('protected bundle ready', group['caption'])
+        self.assertEqual(self.reactions[-1], (1, 88, '🎉'))
 
 
 if __name__ == '__main__':

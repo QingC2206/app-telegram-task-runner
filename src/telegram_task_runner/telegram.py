@@ -149,3 +149,55 @@ class Telegram:
         )
         return self._request_json(request, timeout=timeout)
 
+    def send_media_group(self, chat_id, items: list[dict], *, caption='', reply_to=None, timeout=300):
+        boundary = '----TelegramTaskRunnerBoundary' + secrets.token_hex(12)
+        media_spec = []
+        for idx, item in enumerate(items):
+            entry = {
+                'type': 'photo' if item.get('kind') == 'photo' else 'document',
+                'media': f'attach://file{idx}',
+            }
+            if idx == len(items) - 1 and caption:
+                entry['caption'] = str(caption)[:950]
+            elif not caption and item.get('caption'):
+                entry['caption'] = str(item['caption'])[:900]
+            media_spec.append(entry)
+        fields = {
+            'chat_id': str(chat_id),
+            'media': json.dumps(media_spec, ensure_ascii=False),
+        }
+        if reply_to:
+            fields['reply_parameters'] = json.dumps({'message_id': reply_to, 'allow_sending_without_reply': True})
+        parts = []
+        for key, val in fields.items():
+            parts.append(
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                f'{val}\r\n'.encode('utf-8')
+            )
+        for idx, item in enumerate(items):
+            path = Path(item['path'])
+            display_name = item.get('name') or path.name
+            content_type = mimetypes.guess_type(display_name)[0] or 'application/octet-stream'
+            safe_header_name = display_name.replace('"', '_').replace('\r', '').replace('\n', '')
+            parts.append(
+                f'--{boundary}\r\n'
+                f'Content-Disposition: form-data; name="file{idx}"; filename="{safe_header_name}"\r\n'
+                f'Content-Type: {content_type}\r\n\r\n'.encode('utf-8')
+            )
+            parts.append(path.read_bytes())
+            parts.append(b'\r\n')
+        parts.append(f'--{boundary}--\r\n'.encode('utf-8'))
+        body = b''.join(parts)
+        request = Request(
+            f'{self.api_base_url}/bot{self.token}/sendMediaGroup',
+            data=body,
+            headers={
+                'Content-Type': f'multipart/form-data; boundary={boundary}',
+                'Content-Length': str(len(body)),
+                'User-Agent': 'Telegram-Task-Runner/0.1',
+            },
+            method='POST',
+        )
+        return self._request_json(request, timeout=timeout)
+

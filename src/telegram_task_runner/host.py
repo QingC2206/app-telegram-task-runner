@@ -320,16 +320,40 @@ class Host:
             return
         value = json.loads(job['result'])
         prefix = '✅' if value['ok'] else ('⚠️' if value['status'] in ('uncertain','push_pending') else '❌')
-        self.reply('job:' + job['id'] + ':final', f"{prefix} 任务 {job['id']}\n" + value['message'], job['message_id'], chat_id=job['chat_id'], job_id=job['id'])
-        files = value.get('files') or []
+        final_text = f"{prefix} 任务 {job['id']}\n" + value['message']
+        files = [item for item in (value.get('files') or []) if Path(item['path']).is_file()]
         job_dir = contained(self.layout.runtime / 'jobs', job['id'])
         is_local_api = getattr(self.api, 'is_local_server', False)
         single_limit = (2000 if is_local_api else 49) * 1024 * 1024
+
+        can_group = (
+            2 <= len(files) <= 10
+            and len({item.get('kind', 'document') for item in files}) == 1
+            and sum(Path(item['path']).stat().st_size for item in files) <= single_limit
+        )
+        if can_group:
+            group_items = [
+                {
+                    'path': str(Path(item['path'])),
+                    'kind': item.get('kind', 'document'),
+                    'name': item.get('name') or Path(item['path']).name,
+                    'caption': item.get('caption', ''),
+                }
+                for item in files
+            ]
+            if len(final_text) <= 950:
+                att = {'kind': 'media_group', 'items': group_items, 'caption': final_text}
+                self.reply(f"job:{job['id']}:mediagroup", '', job['message_id'], chat_id=job['chat_id'], job_id=job['id'], attachment=att)
+            else:
+                self.reply('job:' + job['id'] + ':final', final_text, job['message_id'], chat_id=job['chat_id'], job_id=job['id'])
+                att = {'kind': 'media_group', 'items': group_items, 'caption': ''}
+                self.reply(f"job:{job['id']}:mediagroup", '', job['message_id'], chat_id=job['chat_id'], job_id=job['id'], attachment=att)
+            return
+
+        self.reply('job:' + job['id'] + ':final', final_text, job['message_id'], chat_id=job['chat_id'], job_id=job['id'])
         file_index = 0
         for item in files:
             target = Path(item['path'])
-            if not target.is_file():
-                continue
             if item.get('kind') == 'document' and target.stat().st_size > single_limit:
                 parts = split_archive(target, job_dir / 'outputs' / '_split', single_limit)
                 for part_idx, part in enumerate(parts, 1):
@@ -395,20 +419,35 @@ class Host:
         try:
             if value.get('attachment'):
                 att = json.loads(value['attachment'])
-                path = Path(att['path'])
-                if not path.is_file():
-                    raise RuntimeError('待发送的回传文件不存在或已被清理：' + att.get('name', ''))
-                sent = self.api.send_file(
-                    value['chat_id'],
-                    path,
-                    kind=att.get('kind', 'document'),
-                    filename=att.get('name') or path.name,
-                    caption=redact(att.get('caption', ''), self.api.token),
-                    reply_to=value['message_id'],
-                )
+                if att.get('kind') == 'media_group':
+                    items = att.get('items') or []
+                    for item in items:
+                        if not Path(item['path']).is_file():
+                            raise RuntimeError('待发送的回传文件不存在或已被清理：' + item.get('name', ''))
+                    sent = self.api.send_media_group(
+                        value['chat_id'],
+                        items,
+                        caption=redact(att.get('caption', ''), self.api.token),
+                        reply_to=value['message_id'],
+                    )
+                    first_msg = sent[0] if isinstance(sent, list) and sent else (sent if isinstance(sent, dict) else {'message_id': 0})
+                    self.store.delivered(value['id'], 'sent', telegram_id=first_msg.get('message_id', 0))
+                else:
+                    path = Path(att['path'])
+                    if not path.is_file():
+                        raise RuntimeError('待发送的回传文件不存在或已被清理：' + att.get('name', ''))
+                    sent = self.api.send_file(
+                        value['chat_id'],
+                        path,
+                        kind=att.get('kind', 'document'),
+                        filename=att.get('name') or path.name,
+                        caption=redact(att.get('caption', ''), self.api.token),
+                        reply_to=value['message_id'],
+                    )
+                    self.store.delivered(value['id'], 'sent', telegram_id=sent['message_id'])
             else:
                 sent = self.api.send(value['chat_id'], value['text'], value['message_id'])
-            self.store.delivered(value['id'], 'sent', telegram_id=sent['message_id'])
+                self.store.delivered(value['id'], 'sent', telegram_id=sent['message_id'])
         except ApiError as error:
             if error.code == 429:
                 due = time.time()+int(error.parameters.get('retry_after',30))
