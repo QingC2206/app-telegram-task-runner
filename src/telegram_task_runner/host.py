@@ -506,6 +506,7 @@ class Host:
             failures = 0
             self.layout.log('Host started; bot=' + str(self.config['bot_id']))
             try:
+                startup_notice_key = f'host:online:{uuid.uuid4().hex}' if self.config['chat_id'] < 0 else None
                 while not self.stop.is_set():
                     try:
                         for update in self.store.incoming():
@@ -522,6 +523,9 @@ class Host:
                         for update in updates or []:
                             self.store.receive(update)
                         self.poll_result()
+                        if startup_notice_key is not None:
+                            self.reply(startup_notice_key, '✅ 机器人已上线。')
+                            startup_notice_key = None
                         failures = 0
                     except ApiError as error:
                         self.poll_result(error)

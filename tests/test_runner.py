@@ -293,16 +293,19 @@ class HostTests(Sandbox):
 
     def test_full_poll_dispatch_worker_and_notification_flow(self):
         self.plugin(); host = self.make_host()
-        state = {'received':False}
+        polls = 0
         def call(method,payload=None,**options):
+            nonlocal polls
             if method == 'getMe':
                 return {'id':123456,'username':'TestRunnerBot'}
             if method == 'getWebhookInfo':
                 return {'url':''}
             if method == 'setMyCommands':
                 return True
-            if not state['received']:
-                state['received'] = True
+            polls += 1
+            if polls == 1:
+                return []
+            if polls == 2:
                 return [self.update()]
             host.stop.wait(0.02)
             return []
@@ -322,6 +325,7 @@ class HostTests(Sandbox):
             self.assertEqual(host.run(),0)
         finally:
             watchdog.cancel()
+        self.assertEqual(self.api.sent.count((self.config['chat_id'], '✅ 机器人已上线。', None)), 1)
         self.assertTrue(any('original' in text for _,text,_ in self.api.sent))
 
 
