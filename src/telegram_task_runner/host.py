@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import uuid
+from time import monotonic
 from .binding import load_config, parse_command, permitted, permitted_chat, permitted_message
 from .executor import execute
 from .locking import FileLock, BotLock
@@ -14,9 +15,18 @@ from .menus import MenuPublisher, commands_for
 from .plugins import Registry
 from .security import load_token
 from .storage import Store
-from .telegram import Telegram, ApiError
+from .telegram import Telegram, ApiError, DeliveryUnknown
 from .util import atomic_json, contained, redact, sanitize_filename, split_archive
 from .health import interpret as interpret_health
+
+
+TELEGRAM_SLOW_RETRY_DELAYS_SECONDS = (60, 120, 300, 600, 1200, 1800)
+
+
+def is_temporary_telegram_error(error):
+    return isinstance(error, DeliveryUnknown) or (
+        isinstance(error, ApiError) and (error.code in (408, 429) or 500 <= error.code < 600)
+    )
 
 
 def extract_attachment(message: dict) -> dict | None:
@@ -68,6 +78,9 @@ class Host:
         self.workers = []
         self.started_at = time.time()
         self.health_lock = threading.RLock()
+        self.telegram_backoff = threading.Event()
+        self.telegram_retry_started_at = monotonic()
+        self.telegram_slow_retry_index = 0
         self.telegram_health = {'last_poll_success_at':0,'last_error_at':0,'last_error':'','consecutive_failures':0}
 
     def health_snapshot(self, lifecycle='running'):
@@ -81,14 +94,46 @@ class Host:
         with self.health_lock:
             if error is None:
                 self.telegram_health.update(last_poll_success_at=time.time(),consecutive_failures=0)
+                self.telegram_retry_started_at = None
+                self.telegram_slow_retry_index = 0
+                self.telegram_backoff.clear()
             else:
                 self.telegram_health.update(last_error_at=time.time(),last_error=redact(error,self.api.token)[:500],
                                             consecutive_failures=self.telegram_health['consecutive_failures']+1)
+            return self.telegram_health['consecutive_failures']
 
-    def health_loop(self):
+    def next_telegram_retry_delay(self):
+        now = monotonic()
+        if self.telegram_retry_started_at is None:
+            self.telegram_retry_started_at = now
+        elapsed = now - self.telegram_retry_started_at
+        if elapsed < 10 * 60:
+            return 10
+        if elapsed < 20 * 60:
+            return 20
+        if elapsed < 30 * 60:
+            return 30
+        delay = TELEGRAM_SLOW_RETRY_DELAYS_SECONDS[self.telegram_slow_retry_index]
+        self.telegram_slow_retry_index = min(self.telegram_slow_retry_index + 1, len(TELEGRAM_SLOW_RETRY_DELAYS_SECONDS) - 1)
+        return delay
+
+    def wait_before_telegram_retry(self, error):
+        failures = self.poll_result(error)
+        if is_temporary_telegram_error(error):
+            self.telegram_backoff.set()
+            delay = self.next_telegram_retry_delay()
+            if isinstance(error, ApiError) and error.code == 429:
+                delay = max(delay, int(error.parameters.get('retry_after', 30)))
+        else:
+            delay = min(30, 2 ** min(failures, 5))
+        self.layout.log(f'{error}，{delay} 秒后重试', self.api.token)
+        self.stop.wait(delay)
+
+    def health_loop(self, ready):
         while not self.stop.is_set():
             try:
-                atomic_json(self.layout.runtime / 'health.json', self.health_snapshot())
+                lifecycle = 'running' if ready.is_set() else 'starting'
+                atomic_json(self.layout.runtime / 'health.json', self.health_snapshot(lifecycle))
             except Exception as error:
                 self.layout.log('Health snapshot failed: ' + str(error),self.api.token)
             self.stop.wait(5)
@@ -100,6 +145,9 @@ class Host:
     def _apply_reaction(self, chat_id, message_id, emoji):
         if not hasattr(self.api, 'react'):
             self.store.mark_reaction_result(chat_id, message_id, emoji, ok=True)
+            return False
+        if self.telegram_backoff.is_set():
+            self.store.mark_reaction_result(chat_id, message_id, emoji, ok=False)
             return False
         try:
             self.api.react(chat_id, message_id, emoji)
@@ -405,7 +453,7 @@ class Host:
             self.reconcile_job_reaction(job['id'])
 
     def deliver_one(self):
-        if self.store.get('telegram_retry_at', 0) > time.time():
+        if self.telegram_backoff.is_set() or self.store.get('telegram_retry_at', 0) > time.time():
             return False
         for row in self.store.pending_reaction_retries(5):
             self._apply_reaction(row['chat_id'], row['message_id'], row['desired'])
@@ -468,6 +516,8 @@ class Host:
     def sync_menus(self):
         with self.registry_lock:
             self.registry.discover()
+            if self.telegram_backoff.is_set():
+                return
             config = self.config
             # Snapshot menus while plugin discovery is locked. Networking happens
             # after releasing it so command dispatch stays available.
@@ -488,24 +538,41 @@ class Host:
         self.store.recover()
         for job in self.store.jobs(1000):
             self.complete_notice(job)
-        for function, name in ((lambda:self.work('job'),'job-worker'), (lambda:self.work('query'),'query-worker'), (self.send_loop,'telegram-outbox'), (self.watch_loop,'plugin-watch'), (self.health_loop,'health-watch')):
+        for function, name in ((lambda:self.work('job'),'job-worker'), (lambda:self.work('query'),'query-worker'), (self.send_loop,'telegram-outbox'), (self.watch_loop,'plugin-watch')):
             thread = threading.Thread(target=function, name=name, daemon=True)
-            self.workers.append(thread); thread.start()
+            thread.start()
+            self.workers.append(thread)
+
+    def wait_for_telegram(self):
+        while not self.stop.is_set():
+            try:
+                me = self.api.call('getMe')
+                if me['id'] != self.config['bot_id']:
+                    raise RuntimeError('Token 与已绑定机器人不一致，请重新 setup。')
+                if self.api.call('getWebhookInfo').get('url'):
+                    raise RuntimeError('已配置 Webhook，未启动轮询。')
+                return not self.stop.is_set()
+            except (ApiError, DeliveryUnknown) as error:
+                if not is_temporary_telegram_error(error):
+                    raise
+                self.wait_before_telegram_retry(error)
+        return False
 
     def run(self):
         with FileLock(self.layout.runtime / 'host.lock'), BotLock(self.config['bot_id']):
             atomic_json(self.layout.runtime / 'health.json',self.health_snapshot('starting'))
-            me = self.api.call('getMe')
-            if me['id'] != self.config['bot_id']:
-                raise RuntimeError('Token 与已绑定机器人不一致，请重新 setup。')
-            if self.api.call('getWebhookInfo').get('url'):
-                raise RuntimeError('已配置 Webhook，未启动轮询。')
-            if not self.store.get('offset', 0):
-                self.store.set('offset', self.config.get('initial_offset',0))
-            self.start_workers()
-            failures = 0
-            self.layout.log('Host started; bot=' + str(self.config['bot_id']))
             try:
+                ready = threading.Event()
+                heartbeat = threading.Thread(target=self.health_loop, args=(ready,), name='health-watch', daemon=True)
+                heartbeat.start()
+                self.workers.append(heartbeat)
+                if not self.wait_for_telegram():
+                    return 0
+                if not self.store.get('offset', 0):
+                    self.store.set('offset', self.config.get('initial_offset',0))
+                self.start_workers()
+                ready.set()
+                self.layout.log('Host started; bot=' + str(self.config['bot_id']))
                 startup_notice_key = f'host:online:{uuid.uuid4().hex}' if self.config['chat_id'] < 0 else None
                 while not self.stop.is_set():
                     try:
@@ -526,19 +593,11 @@ class Host:
                         if startup_notice_key is not None:
                             self.reply(startup_notice_key, '✅ 机器人已上线。')
                             startup_notice_key = None
-                        failures = 0
-                    except ApiError as error:
-                        self.poll_result(error)
-                        if error.code in (401,409):
-                            raise RuntimeError('Bot Token 已失效或被其他轮询服务占用，请检查独立机器人配置。') from None
-                        failures += 1
-                        self.layout.log(error, self.api.token)
-                        self.stop.wait(min(30, 2 ** min(failures,5)))
                     except Exception as error:
-                        self.poll_result(error)
-                        failures += 1
-                        self.layout.log(error, self.api.token)
-                        self.stop.wait(min(30, 2 ** min(failures,5)))
+                        if isinstance(error, ApiError) and error.code in (401,409):
+                            self.poll_result(error)
+                            raise RuntimeError('Bot Token 已失效或被其他轮询服务占用，请检查独立机器人配置。') from None
+                        self.wait_before_telegram_retry(error)
             finally:
                 self.stop.set()
                 self.menu_refresh.set()

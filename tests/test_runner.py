@@ -168,6 +168,86 @@ class HostTests(Sandbox):
         self.assertEqual(host.health_snapshot()['telegram']['state'],'online')
         self.assertEqual(host.health_snapshot()['telegram']['consecutive_failures'],0)
 
+    def test_startup_retries_use_ten_minute_windows_and_cap_until_stopped(self):
+        self.api.call = Mock(side_effect=DeliveryUnknown('network unavailable'))
+        attempts = [
+            (35, 10), (45, 10), (599, 10),
+            (600, 20), (620, 20), (1199, 20),
+            (1200, 30), (1230, 30), (1799, 30),
+            (1800, 60), (1860, 120), (1980, 300), (2280, 600),
+            (2880, 1200), (4080, 1800), (5880, 1800), (7680, 1800),
+        ]
+        origin = 5000
+        clock_values = [origin] + [origin + elapsed for elapsed, _ in attempts]
+        delays = []
+
+        def wait(delay):
+            delays.append(delay)
+            if len(delays) == len(attempts):
+                host.stop.set()
+            return host.stop.is_set()
+
+        with patch('telegram_task_runner.host.monotonic', side_effect=clock_values):
+            host = self.make_host()
+            with patch.object(host.stop, 'wait', side_effect=wait):
+                self.assertFalse(host.wait_for_telegram())
+        self.assertEqual(delays, [delay for _, delay in attempts])
+        self.assertEqual(self.api.call.call_count, len(attempts))
+
+    def test_polling_resets_backoff_after_success_and_honors_rate_limit(self):
+        self.api.call = Mock(side_effect=[
+            {'id': self.config['bot_id']}, {'url': ''},
+            [],
+            DeliveryUnknown('network unavailable'),
+            ApiError(429, 'slow down', {'retry_after': 25}),
+            ApiError(502, 'bad gateway'),
+            DeliveryUnknown('network unavailable'),
+            [],
+            ApiError(502, 'bad gateway'),
+            DeliveryUnknown('network unavailable'),
+        ])
+        clock_values = [5000, 10000, 10600, 11200, 11800, 11861, 13661]
+        expected_delays = [10, 25, 30, 60, 10, 60]
+        delays = []
+
+        def wait(delay):
+            delays.append(delay)
+            if len(delays) == len(expected_delays):
+                host.stop.set()
+            return host.stop.is_set()
+
+        with patch('telegram_task_runner.host.monotonic', side_effect=clock_values):
+            host = self.make_host()
+            with (
+                patch.object(host, 'start_workers'),
+                patch.object(host, 'health_loop'),
+                patch.object(host.stop, 'wait', side_effect=wait),
+            ):
+                self.assertEqual(host.run(), 0)
+        self.assertEqual(delays, expected_delays)
+
+    def test_backoff_defers_background_delivery_until_poll_succeeds(self):
+        host = self.make_host()
+        chat = self.config['chat_id']
+        self.api.react = Mock()
+        host.reply('queued', 'notification')
+        with patch.object(host.stop, 'wait'):
+            host.wait_before_telegram_retry(DeliveryUnknown('network unavailable'))
+
+        self.assertFalse(host.set_reaction(chat, 10, '👀'))
+        self.assertFalse(host.deliver_one())
+        host.sync_menus()
+        self.api.react.assert_not_called()
+        self.assertEqual(self.api.sent, [])
+        self.assertEqual(self.api.command_calls, [])
+
+        host.poll_result()
+        self.assertTrue(host.deliver_one())
+        host.sync_menus()
+        self.api.react.assert_called_once_with(chat, 10, '👀')
+        self.assertEqual(self.api.sent, [(chat, 'notification', None)])
+        self.assertTrue(self.api.command_calls)
+
     def test_chat_user_anonymous_and_bot_authorization_precede_plugin_dispatch(self):
         self.plugin(); host = self.make_host()
         for update in (self.update(chat=-999),self.update(user=99),self.update(sender_chat={'id':-100}),
@@ -293,10 +373,14 @@ class HostTests(Sandbox):
 
     def test_full_poll_dispatch_worker_and_notification_flow(self):
         self.plugin(); host = self.make_host()
+        identity_checks = 0
         polls = 0
         def call(method,payload=None,**options):
-            nonlocal polls
+            nonlocal identity_checks, polls
             if method == 'getMe':
+                identity_checks += 1
+                if identity_checks == 1:
+                    raise DeliveryUnknown('network unavailable during startup')
                 return {'id':123456,'username':'TestRunnerBot'}
             if method == 'getWebhookInfo':
                 return {'url':''}
@@ -319,14 +403,24 @@ class HostTests(Sandbox):
         self.api.send = send
         # This tests the actual controller loop and real worker subprocess, not Telegram networking.
         import threading
-        watchdog = threading.Timer(10,host.stop.set)
+        watchdog = threading.Timer(15,host.stop.set)
         watchdog.start()
         try:
-            self.assertEqual(host.run(),0)
+            with patch.object(host, 'next_telegram_retry_delay', return_value=0):
+                self.assertEqual(host.run(),0)
         finally:
             watchdog.cancel()
+        self.assertEqual(identity_checks, 2)
         self.assertEqual(self.api.sent.count((self.config['chat_id'], '✅ 机器人已上线。', None)), 1)
         self.assertTrue(any('original' in text for _,text,_ in self.api.sent))
+
+    def test_startup_exits_for_invalid_token(self):
+        host = self.make_host()
+        self.api.call = Mock(side_effect=[ApiError(401, 'Unauthorized')])
+        with self.assertRaisesRegex(ApiError, 'Unauthorized'):
+            host.run()
+        self.api.call.assert_called_once_with('getMe')
+        self.assertEqual(read_health(self.layout)['state'], 'stopped')
 
 
 class PrivateChatTests(Sandbox):
